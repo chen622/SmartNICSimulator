@@ -7,18 +7,17 @@ import (
 )
 
 const (
-	CPS                      = 1100 * 1000      // New connections per second.
-	PPS                      = 25 * 1000 * 1000 // Packets per second.
+	CPS                      = 1500 * 1000      // New connections per second.
+	PPS                      = 50 * 1000 * 1000 // Packets per second.
 	RAT_BATCH_SIZE           = 4                // Packets per batch for rat flow.
 	ELEPHANT_BATCH_SIZE      = 64               // Packets per batch for elephant flow.
-	MAX_OFFLOAD_SPEED        = 200 * 1000
-	MAX_SLOW_PATH_SPEED      = 8 * 1000 * 1000
-	TURNS                    = 50  // Each turn represents 1 second.
-	ELEPHANT_FLOW_PROPORTION = 20  // The proportion of elephant flows.
-	THRESHOLD_ADJUST_METHOD  = 2   // 0: No adjust. 1: Adjust threshold by overOffloadCount. 2: Adjust threshold by offloadCount & overOffloadCount & dropCount.
-	ALPHA_PARAM              = 1   // The alpha parameter for adjust threshold.
-	OMEGA_PARAM_1            = 1   // The first omega parameter for adjust threshold.
-	OMEGA_PARAM_2            = 0.5 // The second omega parameter for adjust threshold.
+	MAX_OFFLOAD_SPEED        = 240 * 1000
+	MAX_SLOW_PATH_SPEED      = 20 * 1000 * 1000
+	TURNS                    = 50 // Each turn represents 1 second.
+	ELEPHANT_FLOW_PROPORTION = 20 // The proportion of elephant flows.
+	THRESHOLD_ADJUST_METHOD  = 0  // 0: No adjust. 1: Adjust threshold by overOffloadCount. 2: Adjust threshold by offloadCount & overOffloadCount & dropCount.
+	ALPHA_PARAM              = 1  // The alpha parameter for adjust threshold.
+	OMEGA_PARAM_1            = 1  // The first omega parameter for adjust threshold.
 )
 
 type Flow struct {
@@ -218,14 +217,18 @@ func AdjustThreshold(ss *SS) {
 }
 
 func main() {
-	fmt.Printf("CPS: %d, PPS: %d, TURNS: %d, ELEPHANT_BATCH_SIZE: %d, ELEPHANT_FLOW_PROPORTION: %d, MAX_OFFLOAD_SPEED: %d, MAX_SLOW_PATH_SPEED: %d\n", CPS, PPS, TURNS, ELEPHANT_BATCH_SIZE, ELEPHANT_FLOW_PROPORTION, MAX_OFFLOAD_SPEED, MAX_SLOW_PATH_SPEED)
+	fmt.Printf("CPS: %d, PPS: %d, TURNS: %d, ELEPHANT_BATCH_SIZE: %d, ELEPHANT_FLOW_PROPORTION: %d, MAX_OFFLOAD_SPEED: %d, ADJUST_METHOD: %d, ALPHA: %f, MAX_SLOW_PATH_SPEED: %d\n", CPS, PPS, TURNS, ELEPHANT_BATCH_SIZE, ELEPHANT_FLOW_PROPORTION, MAX_OFFLOAD_SPEED, THRESHOLD_ADJUST_METHOD, ALPHA_PARAM, MAX_SLOW_PATH_SPEED)
 	// Initialize the packet queue for each turn.
 	//for i := 0; i < PPS; i++ {
 	//	packetQueue[i] = make([]int, ELEPHANT_BATCH_SIZE)
 	//}
 
-	threshold := []int{4}
-	//threshold := []int{-1, 2, 4, 8, 16, 32, 64}
+	var threshold []int
+	if THRESHOLD_ADJUST_METHOD == 0 {
+		threshold = []int{-1, 2, 4, 8, 16, 32, 64}
+	} else {
+		threshold = []int{4}
+	}
 	ssList := make([]*SS, len(threshold))
 	var wg sync.WaitGroup
 	for i := 0; i < len(threshold); i++ {
@@ -254,7 +257,9 @@ func main() {
 
 				ss.SlowPathCount, ss.DropCount, ss.FastPathCount, ss.OffloadRuleCount, ss.OverOffloadRuleCount = 0, 0, 0, 0, 0
 				PacketProcessor(ss)
-				fmt.Printf("turn: %-4d offloadThreshold: %-4d packetCount: %-8d slowPathCount: %-8d dropCount: %-8d fastPathCount: %-8d offloadCount: %-6d overOffloadCount: %-6d\n", turn, ss.OffloadThreshold, ss.PacketAmount, ss.SlowPathCount, ss.DropCount, ss.FastPathCount, ss.OffloadRuleCount, ss.OverOffloadRuleCount)
+				if THRESHOLD_ADJUST_METHOD != 0 {
+					fmt.Printf("turn: %-4d offloadThreshold: %-4d packetCount: %-8d slowPathCount: %-8d dropCount: %-8d fastPathCount: %-8d offloadCount: %-6d overOffloadCount: %-6d\n", turn, ss.OffloadThreshold, ss.PacketAmount, ss.SlowPathCount, ss.DropCount, ss.FastPathCount, ss.OffloadRuleCount, ss.OverOffloadRuleCount)
+				}
 				AdjustThreshold(ss)
 				ss.TotalPacketAmount += ss.PacketAmount
 				ss.TotalDropCount += ss.DropCount
