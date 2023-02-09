@@ -271,7 +271,7 @@ func main() {
 	}
 	wg.Wait()
 	for i := 0; i < len(threshold); i++ {
-		fmt.Printf("threshold: %d, drop rate: %f, latency: %f\n", ssList[i].OffloadThreshold, float64(ssList[i].TotalDropCount)/float64(ssList[i].TotalPacketAmount), (float64(ssList[i].TotalSlowPathCount)*10+float64(ssList[i].TotalPacketAmount)*80)/float64(ssList[i].TotalSlowPathCount+ssList[i].TotalFastPathCount))
+		fmt.Printf("threshold: %d, drop rate: %f, latency: %fus\n", ssList[i].OffloadThreshold, float64(ssList[i].TotalDropCount)/float64(ssList[i].TotalPacketAmount), (float64(ssList[i].TotalFastPathCount)*10+float64(ssList[i].TotalSlowPathCount)*80)/float64(ssList[i].TotalSlowPathCount+ssList[i].TotalFastPathCount))
 	}
 }
 
