@@ -163,11 +163,13 @@ func PacketProcessor(ss *SS) {
 			flow.FastPathCount += uint64(count)
 			ss.FastPathCount += uint64(count)
 		} else { // This flow should be processed by the slow path.
-			if ss.SlowPathCount >= MAX_SLOW_PATH_SPEED {
+			if ss.SlowPathCount >= MAX_SLOW_PATH_SPEED { // The slow path is full.
 				ss.DropCount += uint64(count)
+				ss.FlowMap[flowId].RemainingPackets += uint64(count)
 				continue
-			} else if ss.SlowPathCount+uint64(count) > MAX_SLOW_PATH_SPEED {
+			} else if ss.SlowPathCount+uint64(count) > MAX_SLOW_PATH_SPEED { // The slow path is nearly full.
 				ss.DropCount += uint64(count) - (MAX_SLOW_PATH_SPEED - ss.SlowPathCount)
+				ss.FlowMap[flowId].RemainingPackets += uint64(count) - (MAX_SLOW_PATH_SPEED - ss.SlowPathCount)
 				count = int(MAX_SLOW_PATH_SPEED - ss.SlowPathCount)
 			}
 
@@ -271,7 +273,7 @@ func main() {
 	}
 	wg.Wait()
 	for i := 0; i < len(threshold); i++ {
-		fmt.Printf("threshold: %d, drop rate: %f, latency: %fus\n", ssList[i].OffloadThreshold, float64(ssList[i].TotalDropCount)/float64(ssList[i].TotalPacketAmount), (float64(ssList[i].TotalFastPathCount)*10+float64(ssList[i].TotalSlowPathCount)*80)/float64(ssList[i].TotalSlowPathCount+ssList[i].TotalFastPathCount))
+		fmt.Printf("threshold: %d, drop rate: %f, latency: %fus\n", ssList[i].OffloadThreshold, float64(ssList[i].TotalDropCount)/float64(ssList[i].TotalPacketAmount), (float64(ssList[i].TotalFastPathCount)*10+float64(ssList[i].TotalSlowPathCount+ssList[i].TotalDropCount)*80)/float64(ssList[i].TotalSlowPathCount+ssList[i].TotalFastPathCount))
 	}
 }
 
