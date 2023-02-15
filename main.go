@@ -8,7 +8,7 @@ import (
 
 const (
 	CPS                      = 1400 * 1000      // New connections per second.
-	PPS                      = 50 * 1000 * 1000 // Packets per second.
+	PPS                      = 20 * 1000 * 1000 // Packets per second.
 	RAT_BATCH_SIZE           = 4                // Packets per batch for rat flow.
 	ELEPHANT_BATCH_SIZE      = 64               // Packets per batch for elephant flow.
 	MAX_OFFLOAD_SPEED        = 240 * 1000       // Maximum rule insertion speed to the SmartNIC.
@@ -17,7 +17,7 @@ const (
 	FAST_PATH_LATENCY_US     = 10               // The average latency of the fast path.
 	TURNS                    = 50               // Each turn represents 1 second.
 	ELEPHANT_FLOW_PROPORTION = 20               // The proportion of elephant flows.
-	THRESHOLD_ADJUST_METHOD  = 2                // 0: No adjust. 1: Adjust threshold by overOffloadCount. 2: Adjust threshold by offloadCount & overOffloadCount & dropCount.
+	THRESHOLD_ADJUST_METHOD  = 0                // 0: No adjust. 1: Adjust threshold by overOffloadCount. 2: Adjust threshold by offloadCount & overOffloadCount & dropCount.
 	ALPHA_PARAM              = 0.9              // The alpha parameter for adjust threshold.
 	OMEGA_PARAM_1            = 1                // The first omega parameter for adjust threshold.
 )
@@ -136,7 +136,7 @@ func PacketGenerator(ss *SS) {
 
 	// Generate packets of existing flows.
 	var flowId uint64 = 1
-	for ss.PacketAmount < PPS && flowId < ss.FlowCount-CPS {
+	for ss.PacketAmount+ELEPHANT_BATCH_SIZE <= PPS && flowId < ss.FlowCount-CPS {
 		if ss.FlowMap[flowId].RemainingPackets > 0 {
 			ss.PacketAmount += uint64(GenerateBatchPacket(ss, int(flowId), ss.FlowMap[flowId].RemainingPackets >= 32, false))
 			ss.PacketQueueAmount++
@@ -300,8 +300,8 @@ func main() {
 			}
 			flowFinishCount++
 		}
-		fmt.Printf("threshold: %d, drop rate: %f, latency: %f us, flow finish rate: %f, average flow finish time: %f s\n",
-			ssList[i].OffloadThreshold, float64(ssList[i].TotalDropCount)/float64(ssList[i].TotalPacketAmount),
+		fmt.Printf("threshold: %d, drop rate: %f%%, latency: %f us, flow finish rate: %f, average flow finish time: %f s\n",
+			ssList[i].OffloadThreshold, float64(ssList[i].TotalDropCount)/float64(ssList[i].TotalPacketAmount)*100,
 			(float64(ssList[i].TotalFastPathCount)*FAST_PATH_LATENCY_US+float64(ssList[i].TotalSlowPathCount+ssList[i].TotalDropCount)*SLOW_PATH_LATNECY_US)/float64(ssList[i].TotalSlowPathCount+ssList[i].TotalFastPathCount),
 			float64(flowFinishCount)/float64(len(ssList[i].FlowMap)), float64(flowFinishTime)/float64(flowFinishCount)/1000/1000)
 	}
