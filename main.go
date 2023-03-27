@@ -7,20 +7,23 @@ import (
 )
 
 const (
-	CPS                      = 1400 * 1000      // New connections per second.
-	PPS                      = 50 * 1000 * 1000 // Packets per second.
+	CPS                      = 1200 * 1000      // New connections per second.
+	PPS                      = 36 * 1000 * 1000 // Packets per second.
 	RAT_BATCH_SIZE           = 4                // Packets per batch for rat flow.
-	ELEPHANT_BATCH_SIZE      = 64               // Packets per batch for elephant flow.
+	ELEPHANT_BATCH_SIZE      = 32               // Packets per batch for elephant flow.
 	MAX_OFFLOAD_SPEED        = 220 * 1000       // Maximum rule insertion speed to the SmartNIC.
 	MAX_SLOW_PATH_SPEED      = 19 * 1000 * 1000 // Maximum packet processing speed of the slow path.
 	SLOW_PATH_LATNECY_US     = 50               // The average latency of the slow path.
 	FAST_PATH_LATENCY_US     = 10               // The average latency of the fast path.
-	TURNS                    = 50               // Each turn represents 1 second.
+	TURNS                    = 100              // Each turn represents 1 second.
 	ELEPHANT_FLOW_PROPORTION = 20               // The proportion of elephant flows.
-	THRESHOLD_ADJUST_METHOD  = 1                // 0: No adjust. 1: Adjust threshold by overOffloadCount. 2: Adjust threshold by offloadCount & overOffloadCount & dropCount.
+	THRESHOLD_ADJUST_METHOD  = 2                // 0: No adjust. 1: Adjust threshold by overOffloadCount. 2: Adjust threshold by offloadCount & overOffloadCount & dropCount.
 	ALPHA_PARAM              = 1                // The alpha parameter for adjust threshold.
-	OMEGA_PARAM_1            = 2                // The first omega parameter for adjust threshold.
+	OMEGA_PARAM_1            = 1.5              // The first omega parameter for adjust threshold.
 )
+
+// MAGNIFICATION_OF_EACH_STAGE Make CPS fluctuate.
+var MAGNIFICATION_OF_EACH_STAGE = []float64{0.5, 0.75, 1, 1, 1.25, 1.5, 1.5, 1.25, 1, 0.75, 0.5, 0.25, 0.25, 0.25, 0.25}
 
 type Flow struct {
 	IsOffloaded      bool
@@ -47,6 +50,7 @@ type SS struct {
 	SlowPathCount        uint64  // The quantity of packets in slow path in this turn.
 	DropCount            uint64  // The quantity of dropped packets in this turn.
 	OffloadRuleCount     uint64  // The quantity of offloaded flows in this turn.
+	OffloadRuleQueue     []int   // The queue of offloaded flows.
 	OverOffloadRuleCount uint64  // The quantity of flows that are over offload speed in this turn.
 
 	TotalPacketAmount  uint64 // The total amount of packets.
@@ -65,26 +69,25 @@ type SS struct {
 //	@return The amount of packets generated.
 func GenerateBatchPacket(ss *SS, flowIndex int, isElephant bool, isNew bool) int {
 	batchSize := RAT_BATCH_SIZE
-	if isElephant {
-		if isNew {
-			if ss.OffloadThreshold > 0 {
-				batchSize = ss.OffloadThreshold
-			} else {
-				batchSize = RAT_BATCH_SIZE
-			}
-		} else {
-			batchSize = ELEPHANT_BATCH_SIZE
-		}
+	if isElephant && !isNew {
+		batchSize = ELEPHANT_BATCH_SIZE
 	}
-	//for i := 0; i < batchSize; i++ {
-	//	packetQueue[packetQueueAmount][i] = 0
+	//if isElephant {
+	//	if isNew {
+	//		if ss.OffloadThreshold > 0 {
+	//			batchSize = ss.OffloadThreshold
+	//		} else {
+	//			batchSize = RAT_BATCH_SIZE
+	//		}
+	//	} else {
+	//		batchSize = ELEPHANT_BATCH_SIZE
+	//	}
 	//}
 	ss.PacketQueue[ss.PacketQueueAmount] = []int{}
 
 	count := 0
 	for i := 0; i < Min(batchSize, ss.FlowMap[flowIndex].RemainingPackets); i++ {
 		ss.PacketQueue[ss.PacketQueueAmount] = append(ss.PacketQueue[ss.PacketQueueAmount], flowIndex)
-		//packetQueue[packetQueueAmount][i] = flowIndex
 		count++
 	}
 	ss.FlowMap[flowIndex].RemainingPackets -= uint16(count)
@@ -97,10 +100,16 @@ func GenerateBatchPacket(ss *SS, flowIndex int, isElephant bool, isNew bool) int
 //	@param ss The context of the simulator.
 func PacketGenerator(ss *SS) {
 	// Generate new flows.
-	cps := 100000
-	cps = cps * int(ss.Turn+1) * 8
-	if cps > CPS {
-		cps = CPS
+
+	ratio := MAGNIFICATION_OF_EACH_STAGE[int(ss.Turn)/int(math.Ceil(float64(TURNS)/float64(len(MAGNIFICATION_OF_EACH_STAGE))))]
+	//cpsTarget := int(CPS * )
+	cpsTarget := int(CPS * ratio)
+
+	// Slow start.
+	cps := 400000
+	cps = cps * int(ss.Turn+1)
+	if cps > cpsTarget {
+		cps = cpsTarget
 	}
 	for j := 0; j < cps; j++ {
 		seed := float64((ss.FlowCount - 1) % 100)
@@ -116,23 +125,23 @@ func PacketGenerator(ss *SS) {
 		// 8				0.3 * 0.8 = 0.24
 		// 4				0.4 * 0.8 = 0.32
 		if seed < 0.4*(100-ELEPHANT_FLOW_PROPORTION) {
-			ss.FlowMap = append(ss.FlowMap, &Flow{false, 0, 0, 2, ss.Turn, -1})
+			ss.FlowMap = append(ss.FlowMap, &Flow{false, 0, 0, uint16(4), ss.Turn, -1})
 		} else if seed < (0.4+0.3)*(100-ELEPHANT_FLOW_PROPORTION) {
-			ss.FlowMap = append(ss.FlowMap, &Flow{false, 0, 0, 4, ss.Turn, -1})
+			ss.FlowMap = append(ss.FlowMap, &Flow{false, 0, 0, uint16(8), ss.Turn, -1})
 		} else if seed < (0.7+0.2)*(100-ELEPHANT_FLOW_PROPORTION) {
-			ss.FlowMap = append(ss.FlowMap, &Flow{false, 0, 0, 8, ss.Turn, -1})
+			ss.FlowMap = append(ss.FlowMap, &Flow{false, 0, 0, uint16(12), ss.Turn, -1})
 		} else if seed < (0.9+0.1)*(100-ELEPHANT_FLOW_PROPORTION) {
-			ss.FlowMap = append(ss.FlowMap, &Flow{false, 0, 0, 16, ss.Turn, -1})
+			ss.FlowMap = append(ss.FlowMap, &Flow{false, 0, 0, uint16(16), ss.Turn, -1})
 		} else if seed < 0.3*ELEPHANT_FLOW_PROPORTION+(100-ELEPHANT_FLOW_PROPORTION) {
-			ss.FlowMap = append(ss.FlowMap, &Flow{false, 0, 0, 32, ss.Turn, -1})
+			ss.FlowMap = append(ss.FlowMap, &Flow{false, 0, 0, uint16(32), ss.Turn, -1})
 		} else if seed < (0.3+0.25)*ELEPHANT_FLOW_PROPORTION+(100-ELEPHANT_FLOW_PROPORTION) {
-			ss.FlowMap = append(ss.FlowMap, &Flow{false, 0, 0, 64, ss.Turn, -1})
+			ss.FlowMap = append(ss.FlowMap, &Flow{false, 0, 0, uint16(64), ss.Turn, -1})
 		} else if seed < (0.55+0.2)*ELEPHANT_FLOW_PROPORTION+(100-ELEPHANT_FLOW_PROPORTION) {
-			ss.FlowMap = append(ss.FlowMap, &Flow{false, 0, 0, 128, ss.Turn, -1})
+			ss.FlowMap = append(ss.FlowMap, &Flow{false, 0, 0, uint16(128), ss.Turn, -1})
 		} else if seed < (0.75+0.15)*ELEPHANT_FLOW_PROPORTION+(100-ELEPHANT_FLOW_PROPORTION) {
-			ss.FlowMap = append(ss.FlowMap, &Flow{false, 0, 0, 256, ss.Turn, -1})
+			ss.FlowMap = append(ss.FlowMap, &Flow{false, 0, 0, uint16(256), ss.Turn, -1})
 		} else {
-			ss.FlowMap = append(ss.FlowMap, &Flow{false, 0, 0, 512, ss.Turn, -1})
+			ss.FlowMap = append(ss.FlowMap, &Flow{false, 0, 0, uint16(512), ss.Turn, -1})
 		}
 
 		ss.PacketAmount += uint64(GenerateBatchPacket(ss, int(ss.FlowCount), ss.FlowMap[ss.FlowCount].RemainingPackets >= 32, true))
@@ -142,7 +151,7 @@ func PacketGenerator(ss *SS) {
 
 	// Generate packets of existing flows.
 	var flowId uint64 = 1
-	for ss.PacketAmount+ELEPHANT_BATCH_SIZE <= PPS && flowId < ss.FlowCount-uint64(cps) {
+	for ss.PacketAmount+ELEPHANT_BATCH_SIZE <= uint64(PPS) && flowId < ss.FlowCount-uint64(cps) {
 		if ss.FlowMap[flowId].RemainingPackets > 0 {
 			ss.PacketAmount += uint64(GenerateBatchPacket(ss, int(flowId), ss.FlowMap[flowId].RemainingPackets >= 32, false))
 			ss.PacketQueueAmount++
@@ -164,42 +173,31 @@ func PacketProcessor(ss *SS) {
 		}
 		// Count the amount of packets in this batch.
 		count := len(ss.PacketQueue[flowIndex])
-		//for j := 0; j < ELEPHANT_BATCH_SIZE; j++ {
-		//	if packetQueue[flowIndex][j] == flowId {
-		//		count++
-		//	} else {
-		//		break
-		//	}
-		//}
-
 		flow := ss.FlowMap[flowId]
-		if flow.IsOffloaded { // This flow has been offloaded info fast path.
-			flow.FastPathCount += uint64(count)
-			ss.FastPathCount += uint64(count)
-			if flow.RemainingPackets <= 0 && flow.FinishTurn == -1 {
-				flow.FinishTurn = ss.Turn
-			}
-		} else { // This flow should be processed by the slow path.
-			if ss.SlowPathCount >= MAX_SLOW_PATH_SPEED { // The slow path is full.
-				ss.DropCount += uint64(count)
-				ss.FlowMap[flowId].RemainingPackets += uint16(count)
-				continue
-			} else if ss.SlowPathCount+uint64(count) > MAX_SLOW_PATH_SPEED { // The slow path is nearly full.
-				ss.DropCount += uint64(count) - (MAX_SLOW_PATH_SPEED - ss.SlowPathCount)
-				ss.FlowMap[flowId].RemainingPackets += uint16(uint64(count) - (MAX_SLOW_PATH_SPEED - ss.SlowPathCount))
-				count = int(MAX_SLOW_PATH_SPEED - ss.SlowPathCount)
-			}
 
-			flow.SlowPathCount += uint64(count)
-			ss.SlowPathCount += uint64(count)
-
-			if flow.SlowPathCount >= uint64(ss.OffloadThreshold) && ss.OffloadThreshold != -1 { // If the slow path packet count of this flow exceeds the threshold, offload it to the fast path.
-				if ss.OffloadRuleCount < MAX_OFFLOAD_SPEED {
-					ss.OffloadRuleCount++
-					flow.IsOffloaded = true
+		for i := 0; i < count; i++ {
+			if flow.IsOffloaded { // This flow has been offloaded info fast path.
+				flow.FastPathCount += uint64(count - i)
+				ss.FastPathCount += uint64(count - i)
+				break
+			} else { // This flow should be processed by the slow path.
+				if ss.SlowPathCount >= MAX_SLOW_PATH_SPEED { // The slow path is full.
+					ss.DropCount += uint64(count - i)
+					ss.FlowMap[flowId].RemainingPackets += uint16(count - i)
+					break
 				} else {
-					ss.OverOffloadRuleCount++
-					//fmt.Printf("offload speed exceeds the limit\n")
+					flow.SlowPathCount++
+					ss.SlowPathCount++
+
+					// If the slow path packet count of this flow exceeds the threshold, offload it to the fast path.
+					if flow.SlowPathCount >= uint64(ss.OffloadThreshold) && ss.OffloadThreshold != -1 {
+						if ss.OffloadRuleCount < MAX_OFFLOAD_SPEED {
+							ss.OffloadRuleCount++
+							flow.IsOffloaded = true
+						} else if ss.OverOffloadRuleCount < MAX_OFFLOAD_SPEED {
+							ss.OverOffloadRuleCount++
+						}
+					}
 				}
 			}
 		}
@@ -223,8 +221,8 @@ func AdjustThreshold(ss *SS) {
 			ss.OffloadThreshold /= 2
 		}
 	} else if THRESHOLD_ADJUST_METHOD == 2 {
-		//fmt.Printf("fr: %f rqc:%f pqc: %f\n", float64(ss.OffloadRuleCount)/MAX_OFFLOAD_SPEED, float64(MAX_OFFLOAD_SPEED+ss.OverOffloadRuleCount)/MAX_OFFLOAD_SPEED,
-		//	float64(ss.DropCount)/(float64(MAX_SLOW_PATH_SPEED)*0.5))
+		//fmt.Printf("rc: %f rqc:%f dc: %f\n", float64(ss.OffloadRuleCount)/MAX_OFFLOAD_SPEED, float64(MAX_OFFLOAD_SPEED+ss.OverOffloadRuleCount)/MAX_OFFLOAD_SPEED,
+		//	float64(ss.DropCount)/float64(MAX_SLOW_PATH_SPEED))
 		//ss.OffloadThreshold = int(float64(ss.OffloadThreshold) *
 		//	math.Pow(2.0, float64(ALPHA_PARAM)*
 		//		(float64(ss.OffloadRuleCount*(MAX_OFFLOAD_SPEED+ss.OverOffloadRuleCount))/math.Pow(float64(MAX_OFFLOAD_SPEED), 2.0)-OMEGA_PARAM_1)-
@@ -232,9 +230,9 @@ func AdjustThreshold(ss *SS) {
 		ss.OffloadThreshold = int(float64(ss.OffloadThreshold) *
 			math.Pow(2.0, ss.AlphaParameter*
 				(float64(ss.OffloadRuleCount*(MAX_OFFLOAD_SPEED+ss.OverOffloadRuleCount))/math.Pow(float64(MAX_OFFLOAD_SPEED), 2.0)-OMEGA_PARAM_1)-
-				float64(ss.DropCount)/(float64(MAX_SLOW_PATH_SPEED)*0.5)))
-		if ss.OffloadThreshold < 4 {
-			ss.OffloadThreshold = 4
+				float64(ss.DropCount)/float64(MAX_SLOW_PATH_SPEED)))
+		if ss.OffloadThreshold < 2 {
+			ss.OffloadThreshold = 2
 		}
 		//fmt.Printf("%f %f %f\n", math.Pow(2.0, ss.AlphaParameter*
 		//	(float64(ss.OffloadRuleCount*(MAX_OFFLOAD_SPEED+ss.OverOffloadRuleCount))/math.Pow(float64(MAX_OFFLOAD_SPEED), 2.0)-OMEGA_PARAM_1)-
@@ -247,16 +245,13 @@ func AdjustThreshold(ss *SS) {
 }
 
 func main() {
-	fmt.Printf("CPS: %d, PPS: %d, TURNS: %d, ELEPHANT_BATCH_SIZE: %d, ELEPHANT_FLOW_PROPORTION: %d, MAX_OFFLOAD_SPEED: %d, ADJUST_METHOD: %d, ALPHA: %f, MAX_SLOW_PATH_SPEED: %d\n", CPS, PPS, TURNS, ELEPHANT_BATCH_SIZE, ELEPHANT_FLOW_PROPORTION, MAX_OFFLOAD_SPEED, THRESHOLD_ADJUST_METHOD, ALPHA_PARAM, MAX_SLOW_PATH_SPEED)
-	// Initialize the packet queue for each turn.
-	//for i := 0; i < PPS; i++ {
-	//	packetQueue[i] = make([]int, ELEPHANT_BATCH_SIZE)
-	//}
+	fmt.Printf("CPS: %d, PPS: %d, TURNS: %d, MAGNIFICATION:%v, ELEPHANT_BATCH_SIZE: %d, ELEPHANT_FLOW_PROPORTION: %d, MAX_OFFLOAD_SPEED: %d, ADJUST_METHOD: %d, ALPHA: %v, MAX_SLOW_PATH_SPEED: %d\n", CPS, PPS, TURNS, MAGNIFICATION_OF_EACH_STAGE, ELEPHANT_BATCH_SIZE, ELEPHANT_FLOW_PROPORTION, MAX_OFFLOAD_SPEED, THRESHOLD_ADJUST_METHOD, ALPHA_PARAM, MAX_SLOW_PATH_SPEED)
 
 	var threshold []int
 	var ssList []*SS
 	if THRESHOLD_ADJUST_METHOD == 0 {
 		threshold = []int{-1, 2, 4, 8, 16, 32, 64}
+		//threshold = []int{8}
 		ssList = make([]*SS, len(threshold))
 		for i := 0; i < len(threshold); i++ {
 			ssList[i] = &SS{
@@ -266,7 +261,8 @@ func main() {
 			}
 		}
 	} else if THRESHOLD_ADJUST_METHOD == 2 {
-		alpha := []float64{0.75, 1, 1.25}
+		//alpha := []float64{0.75, 1, 1.25, 1.5}
+		alpha := []float64{0.75}
 		ssList = make([]*SS, len(alpha))
 		for i := 0; i < len(alpha); i++ {
 			ssList[i] = &SS{
@@ -301,18 +297,12 @@ func main() {
 				ss.PacketAmount = 0
 				PacketGenerator(ss)
 
-				//var i uint64 = 0
-				//for ; i < packetQueueAmount; i++ {
-				//	fmt.Printf("%d\n", packetQueue[i])
-				//}
-
 				ss.SlowPathCount, ss.DropCount, ss.FastPathCount, ss.OffloadRuleCount, ss.OverOffloadRuleCount = 0, 0, 0, 0, 0
 				PacketProcessor(ss)
-				if THRESHOLD_ADJUST_METHOD != 0 {
-					//fmt.Printf("turn: %-4d offloadThreshold: %-4d packetCount: %-8d slowPathCount: %-8d dropCount: %-8d fastPathCount: %-8d offloadCount: %-6d overOffloadCount: %-6d\n",
-					//	ss.Turn, ss.OffloadThreshold, ss.PacketAmount, ss.SlowPathCount, ss.DropCount, ss.FastPathCount, ss.OffloadRuleCount, ss.OverOffloadRuleCount)
-					//fmt.Printf("%-4d\n", ss.OffloadThreshold)
-				}
+				//if THRESHOLD_ADJUST_METHOD != 0 {
+				//	fmt.Printf("turn: %-4d offloadThreshold: %-4d packetCount: %-8d slowPathCount: %-8d dropCount: %-8d fastPathCount: %-8d offloadCount: %-6d overOffloadCount: %-6d\n",
+				//		ss.Turn, ss.OffloadThreshold, ss.PacketAmount, ss.SlowPathCount, ss.DropCount, ss.FastPathCount, ss.OffloadRuleCount, ss.OverOffloadRuleCount)
+				//}
 				AdjustThreshold(ss)
 				ss.TotalPacketAmount += ss.PacketAmount
 				ss.TotalDropCount += ss.DropCount
