@@ -1,29 +1,40 @@
 package main
 
 import (
+	"container/heap"
 	"fmt"
 	"math"
+	"math/rand"
 	"sync"
 )
 
 const (
-	CPS                      = 1200 * 1000      // New connections per second.
-	PPS                      = 36 * 1000 * 1000 // Packets per second.
-	RAT_BATCH_SIZE           = 4                // Packets per batch for rat flow.
-	ELEPHANT_BATCH_SIZE      = 32               // Packets per batch for elephant flow.
-	MAX_OFFLOAD_SPEED        = 220 * 1000       // Maximum rule insertion speed to the SmartNIC.
-	MAX_SLOW_PATH_SPEED      = 19 * 1000 * 1000 // Maximum packet processing speed of the slow path.
-	SLOW_PATH_LATNECY_US     = 50               // The average latency of the slow path.
-	FAST_PATH_LATENCY_US     = 10               // The average latency of the fast path.
-	TURNS                    = 100              // Each turn represents 1 second.
-	ELEPHANT_FLOW_PROPORTION = 20               // The proportion of elephant flows.
-	THRESHOLD_ADJUST_METHOD  = 2                // 0: No adjust. 1: Adjust threshold by overOffloadCount. 2: Adjust threshold by offloadCount & overOffloadCount & dropCount.
-	ALPHA_PARAM              = 1                // The alpha parameter for adjust threshold.
-	OMEGA_PARAM_1            = 1.5              // The first omega parameter for adjust threshold.
+	CPS                         = 1200 * 1000      // New connections per second.
+	PPS                         = 36 * 1000 * 1000 // Packets per second.
+	RAT_BATCH_SIZE              = 4                // Packets per batch for rat flow.
+	ELEPHANT_BATCH_SIZE         = 32               // Packets per batch for elephant flow.
+	MAX_OFFLOAD_SPEED           = 220 * 1000       // Maximum rule insertion speed to the SmartNIC.
+	MAX_SLOW_PATH_SPEED         = 19 * 1000 * 1000 // Maximum packet processing speed of the slow path.
+	SLOW_PATH_LATNECY_US        = 50               // The average latency of the slow path.
+	FAST_PATH_LATENCY_US        = 10               // The average latency of the fast path.
+	TURNS                       = 100              // Each turn represents 1 second.
+	ELEPHANT_FLOW_PROPORTION    = 20               // The proportion of elephant flows.
+	THRESHOLD_ADJUST_METHOD     = 3                // 0: No adjust. 1: Adjust threshold by overOffloadCount. 2: Adjust threshold by offloadCount & overOffloadCount & dropCount. 3: elixir.
+	ALPHA_PARAM                 = 1                // The alpha parameter for adjust threshold.
+	OMEGA_PARAM_1               = 1.5              // The first omega parameter for adjust threshold.
+	ELIXIR_HASH_FUNCTIONS       = 8
+	ELIXIR_HASH_SLOTS           = CPS
+	ELIXIR_IDENTIFY_WINDOW_SIZE = 3
+	ELIXIR_REPLACE_WINDOW_SIZE  = 3
+	ELIXIR_MINHEAP_SIZE         = MAX_OFFLOAD_SPEED * ELIXIR_REPLACE_WINDOW_SIZE
+	ELIXIR_HASH_P               = math.MaxInt32
+	ELIXIR_MAX_HASH             = ELIXIR_HASH_P - 1
 )
 
 // MAGNIFICATION_OF_EACH_STAGE Make CPS fluctuate.
-var MAGNIFICATION_OF_EACH_STAGE = []float64{0.5, 0.75, 1, 1, 1.25, 1.5, 1.5, 1.25, 1, 0.75, 0.5, 0.25, 0.25, 0.25, 0.25}
+var MAGNIFICATION_OF_EACH_STAGE = []float64{0.5, 0.75, 1, 1, 1, 0.75, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25}
+
+//var MAGNIFICATION_OF_EACH_STAGE = []float64{1}
 
 type Flow struct {
 	IsOffloaded      bool
@@ -53,10 +64,62 @@ type SS struct {
 	OffloadRuleQueue     []int   // The queue of offloaded flows.
 	OverOffloadRuleCount uint64  // The quantity of flows that are over offload speed in this turn.
 
+	ElixirArray          [][][]uint64         // The array to save information for elixir.
+	ElixirTime           int                  // The index of time slot in the array.
+	ElixirHashParameters []struct{ a, b int } // The parameters for hash function.
+	ElixirMinHeap        PriorityQueue        // The min-heap to help find the top K flows.
+	ElixirMap            map[int]*Item        // The map to look up the item in the min-heap.
+
 	TotalPacketAmount  uint64 // The total amount of packets.
 	TotalDropCount     uint64 // The total amount of dropped packets.
 	TotalSlowPathCount uint64 // The total amount of packets in slow path.
 	TotalFastPathCount uint64 // The total amount of packets in fast path.
+}
+
+// SketchCounter
+//
+//	@Description: Update the counter of sketch and sort flows with min-heap.
+//	@param ss The control block of each goroutine in this simulator.
+//	@param flowIndex The index of the flow.
+//	@param value The value to add to the counter.
+func SketchCounter(ss *SS, flowIndex int, value uint64) {
+	for i := 0; i < ELIXIR_HASH_FUNCTIONS; i++ {
+		hash := ss.ElixirHashParameters[i].a*flowIndex + ss.ElixirHashParameters[i].b
+		hash %= ELIXIR_HASH_P
+		hash %= ELIXIR_HASH_SLOTS
+		ss.ElixirArray[i][hash][ss.ElixirTime] += value
+	}
+	var flowSize uint64 = math.MaxUint64
+	for i := 0; i < ELIXIR_HASH_FUNCTIONS; i++ {
+		hash := ss.ElixirHashParameters[i].a*flowIndex + ss.ElixirHashParameters[i].b
+		hash %= ELIXIR_HASH_P
+		hash %= ELIXIR_HASH_SLOTS
+		var count uint64 = 0
+		for j := 0; j < ELIXIR_IDENTIFY_WINDOW_SIZE/ELIXIR_REPLACE_WINDOW_SIZE; j++ {
+			count += ss.ElixirArray[i][hash][j]
+		}
+		if count < flowSize {
+			flowSize = count
+		}
+	}
+	item := ss.ElixirMap[flowIndex]
+	if item == nil {
+		item = &Item{
+			value:    flowIndex,
+			priority: flowSize,
+		}
+		if len(ss.ElixirMinHeap) < ELIXIR_MINHEAP_SIZE {
+			heap.Push(&ss.ElixirMinHeap, item)
+			ss.ElixirMap[flowIndex] = item
+		} else if flowSize > ss.ElixirMinHeap[0].priority {
+			oldItem := heap.Pop(&ss.ElixirMinHeap)
+			delete(ss.ElixirMap, oldItem.(*Item).value)
+			heap.Push(&ss.ElixirMinHeap, item)
+			ss.ElixirMap[flowIndex] = item
+		}
+	} else {
+		ss.ElixirMinHeap.Update(item, flowIndex, flowSize)
+	}
 }
 
 // GenerateBatchPacket
@@ -111,6 +174,7 @@ func PacketGenerator(ss *SS) {
 	if cps > cpsTarget {
 		cps = cpsTarget
 	}
+	//fmt.Printf("%d ", cps)
 	for j := 0; j < cps; j++ {
 		seed := float64((ss.FlowCount - 1) % 100)
 		// The proportion of packets.
@@ -179,6 +243,9 @@ func PacketProcessor(ss *SS) {
 			if flow.IsOffloaded { // This flow has been offloaded info fast path.
 				flow.FastPathCount += uint64(count - i)
 				ss.FastPathCount += uint64(count - i)
+				if THRESHOLD_ADJUST_METHOD == 3 {
+					SketchCounter(ss, flowId, uint64(count-i))
+				}
 				break
 			} else { // This flow should be processed by the slow path.
 				if ss.SlowPathCount >= MAX_SLOW_PATH_SPEED { // The slow path is full.
@@ -188,7 +255,9 @@ func PacketProcessor(ss *SS) {
 				} else {
 					flow.SlowPathCount++
 					ss.SlowPathCount++
-
+					if THRESHOLD_ADJUST_METHOD == 3 {
+						SketchCounter(ss, flowId, 1)
+					}
 					// If the slow path packet count of this flow exceeds the threshold, offload it to the fast path.
 					if flow.SlowPathCount >= uint64(ss.OffloadThreshold) && ss.OffloadThreshold != -1 {
 						if ss.OffloadRuleCount < MAX_OFFLOAD_SPEED {
@@ -207,11 +276,11 @@ func PacketProcessor(ss *SS) {
 	}
 }
 
-// AdjustThreshold
+// PostProcess
 //
-//	@Description: Adjust the threshold to offloading.
+//	@Description: The operation after packet processing.
 //	@param ss The context of the simulator.
-func AdjustThreshold(ss *SS) {
+func PostProcess(ss *SS) {
 	if THRESHOLD_ADJUST_METHOD == 0 {
 		return
 	} else if THRESHOLD_ADJUST_METHOD == 1 {
@@ -223,10 +292,6 @@ func AdjustThreshold(ss *SS) {
 	} else if THRESHOLD_ADJUST_METHOD == 2 {
 		//fmt.Printf("rc: %f rqc:%f dc: %f\n", float64(ss.OffloadRuleCount)/MAX_OFFLOAD_SPEED, float64(MAX_OFFLOAD_SPEED+ss.OverOffloadRuleCount)/MAX_OFFLOAD_SPEED,
 		//	float64(ss.DropCount)/float64(MAX_SLOW_PATH_SPEED))
-		//ss.OffloadThreshold = int(float64(ss.OffloadThreshold) *
-		//	math.Pow(2.0, float64(ALPHA_PARAM)*
-		//		(float64(ss.OffloadRuleCount*(MAX_OFFLOAD_SPEED+ss.OverOffloadRuleCount))/math.Pow(float64(MAX_OFFLOAD_SPEED), 2.0)-OMEGA_PARAM_1)-
-		//		float64(ss.DropCount)*float64(ss.DropCount-OMEGA_PARAM_2*MAX_SLOW_PATH_SPEED)/math.Pow(float64(MAX_SLOW_PATH_SPEED), 2.0)))
 		ss.OffloadThreshold = int(float64(ss.OffloadThreshold) *
 			math.Pow(2.0, ss.AlphaParameter*
 				(float64(ss.OffloadRuleCount*(MAX_OFFLOAD_SPEED+ss.OverOffloadRuleCount))/math.Pow(float64(MAX_OFFLOAD_SPEED), 2.0)-OMEGA_PARAM_1)-
@@ -239,6 +304,21 @@ func AdjustThreshold(ss *SS) {
 		//	float64(ss.DropCount)/(float64(MAX_SLOW_PATH_SPEED)*0.5)),
 		//	float64(ss.OffloadRuleCount*(MAX_OFFLOAD_SPEED+ss.OverOffloadRuleCount))/math.Pow(float64(MAX_OFFLOAD_SPEED), 2.0)-OMEGA_PARAM_1,
 		//	float64(ss.DropCount)/(float64(MAX_SLOW_PATH_SPEED)*0.5))
+	} else if THRESHOLD_ADJUST_METHOD == 3 {
+		if ss.Turn%ELIXIR_REPLACE_WINDOW_SIZE == 0 {
+			for _, flow := range ss.FlowMap {
+				flow.IsOffloaded = false
+			}
+			for _, item := range ss.ElixirMap {
+				ss.FlowMap[item.value].IsOffloaded = true
+			}
+			ss.ElixirTime = (ss.ElixirTime + 1) % (ELIXIR_IDENTIFY_WINDOW_SIZE / ELIXIR_REPLACE_WINDOW_SIZE)
+			for i := 0; i < ELIXIR_HASH_FUNCTIONS; i++ {
+				for j := 0; j < ELIXIR_HASH_SLOTS; j++ {
+					ss.ElixirArray[i][j][ss.ElixirTime] = 0
+				}
+			}
+		}
 	} else {
 		panic("invalid threshold adjust method")
 	}
@@ -260,9 +340,17 @@ func main() {
 				PacketQueue:      make([][]int, PPS),
 			}
 		}
+	} else if THRESHOLD_ADJUST_METHOD == 1 {
+		threshold = []int{4}
+		ssList = append(ssList, &SS{
+			AlphaParameter:   ALPHA_PARAM,
+			OffloadThreshold: 4,
+			FlowMap:          []*Flow{},
+			PacketQueue:      make([][]int, PPS),
+		})
 	} else if THRESHOLD_ADJUST_METHOD == 2 {
-		//alpha := []float64{0.75, 1, 1.25, 1.5}
-		alpha := []float64{0.75}
+		alpha := []float64{0.75, 1, 1.25}
+		//alpha := []float64{0.75}
 		ssList = make([]*SS, len(alpha))
 		for i := 0; i < len(alpha); i++ {
 			ssList[i] = &SS{
@@ -272,14 +360,23 @@ func main() {
 				PacketQueue:      make([][]int, PPS),
 			}
 		}
-	} else {
-		threshold = []int{4}
+	} else if THRESHOLD_ADJUST_METHOD == 3 {
 		ssList = append(ssList, &SS{
-			AlphaParameter:   ALPHA_PARAM,
-			OffloadThreshold: 4,
 			FlowMap:          []*Flow{},
+			OffloadThreshold: -1, // Do not use offload threshold to filter flow.
 			PacketQueue:      make([][]int, PPS),
+			ElixirArray:      make([][][]uint64, ELIXIR_HASH_FUNCTIONS),
+			ElixirTime:       0,
 		})
+		for i := 0; i < ELIXIR_HASH_FUNCTIONS; i++ {
+			ssList[0].ElixirHashParameters = append(ssList[0].ElixirHashParameters, struct{ a, b int }{a: rand.Intn(ELIXIR_MAX_HASH), b: rand.Intn(ELIXIR_MAX_HASH)})
+			ssList[0].ElixirArray[i] = make([][]uint64, ELIXIR_HASH_SLOTS)
+			for j := 0; j < ELIXIR_HASH_SLOTS; j++ {
+				ssList[0].ElixirArray[i][j] = make([]uint64, ELIXIR_IDENTIFY_WINDOW_SIZE/ELIXIR_REPLACE_WINDOW_SIZE)
+			}
+		}
+	} else {
+		panic("invalid threshold adjust method")
 	}
 
 	var wg sync.WaitGroup
@@ -295,15 +392,23 @@ func main() {
 				// Generate new flows.
 				ss.PacketQueueAmount = 0
 				ss.PacketAmount = 0
+
+				if THRESHOLD_ADJUST_METHOD == 3 {
+					ss.ElixirMap = make(map[int]*Item)
+					ss.ElixirMinHeap = make(PriorityQueue, 0)
+					heap.Init(&ss.ElixirMinHeap)
+				}
+
 				PacketGenerator(ss)
 
 				ss.SlowPathCount, ss.DropCount, ss.FastPathCount, ss.OffloadRuleCount, ss.OverOffloadRuleCount = 0, 0, 0, 0, 0
 				PacketProcessor(ss)
-				//if THRESHOLD_ADJUST_METHOD != 0 {
-				//	fmt.Printf("turn: %-4d offloadThreshold: %-4d packetCount: %-8d slowPathCount: %-8d dropCount: %-8d fastPathCount: %-8d offloadCount: %-6d overOffloadCount: %-6d\n",
-				//		ss.Turn, ss.OffloadThreshold, ss.PacketAmount, ss.SlowPathCount, ss.DropCount, ss.FastPathCount, ss.OffloadRuleCount, ss.OverOffloadRuleCount)
-				//}
-				AdjustThreshold(ss)
+				if len(ssList) == 1 {
+					//fmt.Printf("%d\n", ss.PacketAmount)
+					//fmt.Printf("turn: %-4d offloadThreshold: %-4d packetCount: %-8d slowPathCount: %-8d dropCount: %-8d fastPathCount: %-8d offloadCount: %-6d overOffloadCount: %-6d\n",
+					//	ss.Turn, ss.OffloadThreshold, ss.PacketAmount, ss.SlowPathCount, ss.DropCount, ss.FastPathCount, ss.OffloadRuleCount, ss.OverOffloadRuleCount)
+				}
+				PostProcess(ss)
 				ss.TotalPacketAmount += ss.PacketAmount
 				ss.TotalDropCount += ss.DropCount
 				ss.TotalSlowPathCount += ss.SlowPathCount
@@ -326,10 +431,17 @@ func main() {
 			}
 			flowFinishCount++
 		}
-		fmt.Printf("threshold: %d, alpha: %f, drop rate: %f%%, latency: %f us, flow finish rate: %f%%, average flow finish time: %f s\n",
-			ssList[i].OffloadThreshold, ssList[i].AlphaParameter, float64(ssList[i].TotalDropCount)/float64(ssList[i].TotalPacketAmount)*100,
-			(float64(ssList[i].TotalFastPathCount)*FAST_PATH_LATENCY_US+float64(ssList[i].TotalSlowPathCount+ssList[i].TotalDropCount)*SLOW_PATH_LATNECY_US)/float64(ssList[i].TotalSlowPathCount+ssList[i].TotalFastPathCount),
-			float64(flowFinishCount)/float64(len(ssList[i].FlowMap))*100, float64(flowFinishTime)/float64(flowFinishCount)/1000/1000)
+		if THRESHOLD_ADJUST_METHOD != 3 {
+			fmt.Printf("threshold: %d, alpha: %f, drop rate: %f%%, latency: %f us, flow finish rate: %f%%, average flow finish time: %f s\n",
+				ssList[i].OffloadThreshold, ssList[i].AlphaParameter, float64(ssList[i].TotalDropCount)/float64(ssList[i].TotalPacketAmount)*100,
+				(float64(ssList[i].TotalFastPathCount)*FAST_PATH_LATENCY_US+float64(ssList[i].TotalSlowPathCount+ssList[i].TotalDropCount)*SLOW_PATH_LATNECY_US)/float64(ssList[i].TotalSlowPathCount+ssList[i].TotalFastPathCount),
+				float64(flowFinishCount)/float64(len(ssList[i].FlowMap))*100, float64(flowFinishTime)/float64(flowFinishCount)/1000/1000)
+		} else {
+			fmt.Printf("identification window: %d, replacement window: %d, drop rate: %f%%, latency: %f us, flow finish rate: %f%%, average flow finish time: %f s\n",
+				ELIXIR_IDENTIFY_WINDOW_SIZE, ELIXIR_REPLACE_WINDOW_SIZE, float64(ssList[i].TotalDropCount)/float64(ssList[i].TotalPacketAmount)*100,
+				(float64(ssList[i].TotalFastPathCount)*FAST_PATH_LATENCY_US+float64(ssList[i].TotalSlowPathCount+ssList[i].TotalDropCount)*SLOW_PATH_LATNECY_US)/float64(ssList[i].TotalSlowPathCount+ssList[i].TotalFastPathCount),
+				float64(flowFinishCount)/float64(len(ssList[i].FlowMap))*100, float64(flowFinishTime)/float64(flowFinishCount)/1000/1000)
+		}
 	}
 }
 
